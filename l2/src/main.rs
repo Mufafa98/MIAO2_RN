@@ -77,7 +77,8 @@ struct PeFile {
 fn machine_name(machine: u16) -> &'static str {
     match machine {
         0x014C => "x86",
-        // TODO: add x64 (0x8664) and ARM64 (0xAA64)
+        0x8664 => "x64",
+        0xAA64 => "ARM64",
         _ => "unknown",
     }
 }
@@ -85,20 +86,34 @@ fn machine_name(machine: u16) -> &'static str {
 fn subsystem_name(subsystem: u16) -> &'static str {
     match subsystem {
         1 => "Native",
-        // TODO: add 2 (Windows GUI) and 3 (Windows console)
+        2 => "Windows GUI",
+        3 => "Windows console",
         _ => "unknown",
     }
 }
 
 fn data_directory_name(index: usize) -> &'static str {
-    // TODO: complete the list of the 16 data directory names (see the lab page)
     const NAMES: [&str; 16] = [
-        "Export", "Import", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+        "Export",
+        "Import",
+        "Resource",
+        "Exception",
+        "Security",
+        "BaseReloc",
+        "Debug",
+        "Architecture",
+        "GlobalPtr",
+        "TLS",
+        "LoadConfig",
+        "BoundImport",
+        "IAT",
+        "DelayImport",
+        "CLR",
+        "Reserved",
     ];
     NAMES.get(index).copied().unwrap_or("?")
 }
 
-// TODO: complete both flag tables (see the lab page). decode_flags() shows unknown bits in hex.
 const FILE_CHARACTERISTICS: &[(u64, &str)] =
     &[(0x0001, "RELOCS_STRIPPED"), (0x0002, "EXECUTABLE_IMAGE")];
 
@@ -113,8 +128,16 @@ fn section_permissions(characteristics: u32) -> String {
     } else {
         '-'
     };
-    let w = '-'; // TODO
-    let x = '-'; // TODO
+    let x = if characteristics & 0x2000_0000 != 0 {
+        'X'
+    } else {
+        '-'
+    };
+    let w = if characteristics & 0x8000_0000 != 0 {
+        'W'
+    } else {
+        '-'
+    };
     format!("{}{}{}", r, w, x)
 }
 
@@ -138,21 +161,36 @@ fn parse_dos_header(data: &[u8]) -> Result<DosHeader> {
 
 /// Reads the 4-byte signature at `offset` and returns an error if it is not "PE\0\0" (0x00004550).
 fn check_pe_signature(data: &[u8], offset: u64) -> Result<()> {
-    // TODO
-    Err(ParseError::new("TODO: implement check_pe_signature()"))
+    let sig = read_u32(data, offset)?;
+    if sig != 0x00004550 {
+        return Err(ParseError::new("Selected executable is not in PE format"));
+    }
+    Ok(())
 }
 
 /// `offset` is where the COFF file header starts (right after the signature).
 fn parse_file_header(data: &[u8], offset: u64) -> Result<FileHeader> {
-    // TODO: read Machine, NumberOfSections, TimeDateStamp, SizeOfOptionalHeader, Characteristics
-    Err(ParseError::new("TODO: implement parse_file_header()"))
+    print!("0x{:08X}", offset);
+    let file = FileHeader {
+        machine: read_u16(data, offset)?,
+        number_of_sections: read_u16(data, offset + 0x02)?,
+        time_date_stamp: read_u32(data, offset + 0x04)?,
+        size_of_optional_header: read_u16(data, offset + 0x10)?,
+        characteristics: read_u16(data, offset + 0x12)?,
+    };
+    Ok(file)
 }
 
 /// Reads `count` entries of 8 bytes each: { u32 VirtualAddress (RVA); u32 Size; }
 fn parse_data_directories(data: &[u8], offset: u64, count: u32) -> Result<Vec<DataDirectory>> {
     let mut directories: Vec<DataDirectory> = Vec::new();
-    // TODO
-    Err(ParseError::new("TODO: implement parse_data_directories()"))
+    for i in 0..count as u64 {
+        directories.push(DataDirectory {
+            rva: read_u32(data, offset + i * 8)?,
+            size: read_u32(data, offset + 4 + i * 8)?,
+        });
+    }
+    Ok(directories)
 }
 
 /// `offset` is where the optional header starts. Remember: some offsets differ between PE32 and PE32+.
@@ -161,21 +199,88 @@ fn parse_optional_header(
     offset: u64,
     size_of_optional_header: u16,
 ) -> Result<OptionalHeader> {
-    // TODO:
-    //   1. read Magic; return an error if it is neither 0x10B (PE32) nor 0x20B (PE32+)
-    //   2. read the other fields, using the right offsets for PE32 / PE32+
-    //   3. never trust NumberOfRvaAndSizes: parse at most 16 data directories
-    //   4. return an error if size_of_optional_header is too small to hold the data directories
-    //   5. data_directories: parse_data_directories(...)?
-    Err(ParseError::new("TODO: implement parse_optional_header()"))
+    let magic = read_u16(data, offset)?;
+    let is_pe32_plus = match magic {
+        0x10B => false,
+        0x20B => true,
+        _ => {
+            return Err(ParseError::new(format!(
+                "unsupported optional header magic {}",
+                hex(magic as u64, 4)
+            )));
+        }
+    };
+
+    let address_of_entry_point = read_u32(data, offset + 0x10)?;
+
+    let image_base = if is_pe32_plus {
+        read_u64(data, offset + 0x18)?
+    } else {
+        read_u32(data, offset + 0x1C)? as u64
+    };
+
+    let section_alignment = read_u32(data, offset + 0x20)?;
+    let file_alignment = read_u32(data, offset + 0x24)?;
+    let size_of_image = read_u32(data, offset + 0x38)?;
+    let size_of_headers = read_u32(data, offset + 0x3C)?;
+    let subsystem = read_u16(data, offset + 0x44)?;
+    let dll_characteristics = read_u16(data, offset + 0x46)?;
+
+    let number_of_rva_and_sizes = if is_pe32_plus {
+        read_u32(data, offset + 0x6C)?
+    } else {
+        read_u32(data, offset + 0x5C)?
+    };
+
+    let data_directories_offset: u64 = if is_pe32_plus { 0x70 } else { 0x60 };
+    let count = number_of_rva_and_sizes.min(16);
+    let required_size = data_directories_offset + count as u64 * 8;
+
+    if (size_of_optional_header as u64) < required_size {
+        return Err(ParseError::new(format!(
+            "SizeOfOptionalHeader ({}) is too small for {} data directories (needs at least {} bytes)",
+            hex(size_of_optional_header as u64, 4),
+            count,
+            required_size
+        )));
+    }
+
+    let data_directories = parse_data_directories(data, offset + data_directories_offset, count)?;
+
+    Ok(OptionalHeader {
+        magic,
+        is_pe32_plus,
+        address_of_entry_point,
+        image_base,
+        section_alignment,
+        file_alignment,
+        size_of_image,
+        size_of_headers,
+        subsystem,
+        dll_characteristics,
+        number_of_rva_and_sizes,
+        data_directories,
+    })
 }
 
 /// `offset` is where the section table starts; each section header is 40 bytes.
 fn parse_sections(data: &[u8], offset: u64, count: u16) -> Result<Vec<Section>> {
     let mut sections: Vec<Section> = Vec::new();
-    // TODO: for each section read Name (read_fixed_string, 8 bytes), VirtualSize, VirtualAddress,
-    //       SizeOfRawData, PointerToRawData, Characteristics
-    Err(ParseError::new("TODO: implement parse_sections()"))
+
+    for i in 0..count as u64 {
+        let section_offset = offset + i * 40;
+
+        sections.push(Section {
+            name: read_fixed_string(data, section_offset, 8)?,
+            virtual_size: read_u32(data, section_offset + 0x08)?,
+            virtual_address: read_u32(data, section_offset + 0x0C)?,
+            size_of_raw_data: read_u32(data, section_offset + 0x10)?,
+            pointer_to_raw_data: read_u32(data, section_offset + 0x14)?,
+            characteristics: read_u32(data, section_offset + 0x24)?,
+        });
+    }
+
+    Ok(sections)
 }
 
 // =============================================================================================
@@ -186,7 +291,22 @@ fn parse_sections(data: &[u8], offset: u64, count: u16) -> Result<Vec<Section>> 
 /// VirtualAddress <= rva < VirtualAddress + VirtualSize
 /// (some linkers write VirtualSize = 0; in that case use SizeOfRawData)
 fn find_section(pe: &PeFile, rva: u32) -> Option<&Section> {
-    // TODO
+    for section in &pe.sections {
+        let size = if section.virtual_size == 0 {
+            section.size_of_raw_data
+        } else {
+            section.virtual_size
+        };
+
+        let start = section.virtual_address as u64;
+        let end = start + size as u64;
+        let rva = rva as u64;
+
+        if rva >= start && rva < end {
+            return Some(section);
+        }
+    }
+
     None
 }
 
@@ -196,8 +316,18 @@ fn find_section(pe: &PeFile, rva: u32) -> Option<&Section> {
 ///   - delta = rva - VirtualAddress     -> delta >= SizeOfRawData: zero-filled memory, return None
 ///   - offset = PointerToRawData + delta
 fn rva_to_offset(pe: &PeFile, rva: u32) -> Option<u64> {
-    // TODO
-    None
+    if rva < pe.optional.size_of_headers {
+        return Some(rva as u64);
+    }
+
+    let section = find_section(pe, rva)?;
+    let delta = rva - section.virtual_address;
+
+    if delta >= section.size_of_raw_data {
+        return None;
+    }
+
+    Some(section.pointer_to_raw_data as u64 + delta as u64)
 }
 
 // =============================================================================================
@@ -373,18 +503,18 @@ fn run(path: &str) -> Result<()> {
     print_pe_signature(pe_offset);
 
     // Step 3: the COFF file header follows the 4-byte signature.
-    let file_header_offset: u64 = 0; // TODO
+    let file_header_offset: u64 = pe_offset + 4;
     let file = parse_file_header(&data, file_header_offset)?;
     print_file_header(&file);
 
     // Step 4: the optional header follows the 20-byte COFF file header.
-    let optional_header_offset: u64 = 0; // TODO
+    let optional_header_offset: u64 = file_header_offset + 20;
     let optional =
         parse_optional_header(&data, optional_header_offset, file.size_of_optional_header)?;
     print_optional_header(&optional);
 
     // Step 5: the section table follows the optional header (SizeOfOptionalHeader bytes).
-    let section_table_offset: u64 = 0; // TODO
+    let section_table_offset: u64 = optional_header_offset + file.size_of_optional_header as u64;
     let sections = parse_sections(&data, section_table_offset, file.number_of_sections)?;
     print_sections(&sections);
 
